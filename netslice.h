@@ -6,30 +6,45 @@
 #include <linux/filter.h>
 #endif
 
+#define NETSLICE_NAME_SIZE 64
+
+struct netslice_filter {
+	uint8_t hooks;
+	struct sock_fprog filter;
+	char name[NETSLICE_NAME_SIZE];
+};
+
+struct netslice_queue {
+	struct sk_buff_head skbs;
+	unsigned long bytes;
+	unsigned long dropped;
+	unsigned long total;
+	wait_queue_head_t wait;
+};
+
+struct netslice {
+	struct list_head netslices;
+	char name[NETSLICE_NAME_SIZE];
+	atomic_t references;
+
+	uint8_t hooks;
+	struct net *net;
+	struct sk_filter *filter;
+
+	struct netslice_queue *read_queue[NR_CPUS];
+	struct netslice_queue *write_queue[NR_CPUS];
+};
+
+struct netslice_handle {
+	struct netslice *netslice;
+	int cpu;
+};
+
 enum netslice_pre_tx_csum {
 	NETSLICE_PRE_TX_CSUM_NONE,
 	NETSLICE_PRE_TX_CSUM_IP,
 	NETSLICE_PRE_TX_CSUM_TRANSPORT,
 	NETSLICE_PRE_TX_CSUM_MAX,
-};
-
-enum netslice_iov_flags {
-	NETSLICE_IOV_SKIP_PACKET_MASK = 0x1,
-	NETSLICE_IOV_CSUM_MASK = 0x2,
-	NETSLICE_IOV_CSUM_TRANSPORT_MASK = 0x4,
-};
-
-struct netslice_iov {
-	void *iov_base;
-	size_t iov_len;
-	size_t iov_rlen;
-	int flags;
-};
-
-struct netslice_filter {
-	struct sock_filter *filter;
-	size_t len;
-	int hook;
 };
 
 #define NETSLICE_CPU_SET _IOW('p', 0x01, int)
@@ -39,4 +54,4 @@ struct netslice_filter {
 #define NETSLICE_ATTACH_FILTER _IOW('p', 0x05, struct netslice_filter)
 #define NETSLICE_DETACH_FILTER _IOR('p', 0x06, int)
 
-#endif /* __NETSLICE_H__ */
+#endif
