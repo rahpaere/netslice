@@ -122,6 +122,7 @@ struct netslice_stats {
 
 struct netslice_hook_stats {
 	unsigned long cnt;
+	int nons;
 	int noiface;
 	int nomatch;
 	int nofilter;
@@ -156,6 +157,7 @@ struct netslice {
 	struct skb_list_head snd_queue;
 	void (*pre_tx_csum) (struct sk_buff *);
 	struct sk_filter *filters[NF_INET_NUMHOOKS];
+	struct net *net_ns;
 	int cpu;
 	atomic_t refcnt;
 	struct netslice_hook_stats hook_stats[NF_INET_NUMHOOKS];
@@ -301,6 +303,7 @@ static long netslice_ioctl(struct file *file, unsigned int cmd,
 		}
 		bpf_jit_compile(filter);
 		netslice->filters[nsfilter.hook] = filter;
+		netslice->net_ns = current->nsproxy->net_ns;
 		break;
 
 	case NETSLICE_DETACH_FILTER:
@@ -311,6 +314,7 @@ static long netslice_ioctl(struct file *file, unsigned int cmd,
 			return -EINVAL;
 		filter = netslice->filters[i];
 		netslice->filters[i] = NULL;
+		netslice->net_ns = NULL;
 		bpf_jit_free(filter);
 		kfree(filter);
 		break;
@@ -836,7 +840,13 @@ static unsigned int netslice_nf_hook(unsigned int hook, struct sk_buff *skb,
 	int err = 0;
 	struct skb_list *skb_list_elem;
 
-	/* be polite and don't interfere on the no_iface interface */
+	if ((indev == NULL || dev_net(indev) != slice->net_ns)
+			&& (outdev == NULL || dev_net(outdev) != slice->net_ns))
+	{
+		slice->hook_stats[hook].nons++;
+		return NF_ACCEPT;
+	}
+
 	if ((netslice_res.no_iface) &&
 	    ((indev != NULL && netslice_res.no_iface_ifindex == indev->ifindex)
 	     || (outdev != NULL
@@ -945,8 +955,8 @@ int proc_put_userland(char *page, char **start, off_t off, int count,
 			    &slice->hook_stats[i];
 			len +=
 			    sprintf(&dest[len],
-				    "\tHOOK %d cnt: %lu, noiface: %d, nomatch %d, nofilter %d, dropped %d, nonlinear %d\n",
-				    i, s->cnt, s->noiface, s->nomatch,
+				    "\tHOOK %d cnt: %lu, nons: %d, noiface: %d, nomatch %d, nofilter %d, dropped %d, nonlinear %d\n",
+				    i, s->cnt, s->nons, s->noiface, s->nomatch,
 				    s->nofilter, s->nf_hook_dropped,
 				    s->skb_nonlinear);
 		}
