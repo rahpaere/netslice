@@ -130,98 +130,90 @@ static int get_pre_tx_csum(struct netslice *slice)
 
 
 
-rwlock_t netslices_lock;
-struct list netslices;
+static rwlock_t netslices_lock;
+static struct list netslices;
 
-static struct netslice_queue *netslice_queue_create(void)
+static int netslice_queue_init(struct netslice_queue *q)
 {
-	struct netslice_queue *netslice_queue;
 	int ret;
 
-	netslice_queue = kmalloc(sizeof(*netslice_queue), GFP_KERNEL);
-	if (!netslice_queue)
-		return NULL;
-	memset(netslice_queue, 0, sizeof(*netslice_queue));
-	ret = skb_queue_head_init(&netslice_queue->queue);
-	if (ret) {
-		kfree(netslice_queue);
-		return NULL;
-	}
-	ret = init_waitqueue_head(&netslice_queue->wait);
-	if (ret) {
-		/* FIXME: destroy netslice_queue->queue */
-		kfree(netslice_queue);
-		return NULL;
-	}
-	return netslice_queue;
+	ret = skb_queue_head_init(&q->pending);
+	if (ret)
+		return ret;
+
+	ret = init_waitqueue_head(&q->wait);
+	if (ret)
+		return ret;
+
+	q->total = 0;
+	q->dropped = 0;
+	return 0;
 }
 
-static void netslice_queue_destroy(struct netslice_queue *netslice_queue)
+static int netslice_filter_init(struct netslice *n,
+				struct netslice_filter *f)
 {
-	/* FIXME: destroy netslice_queue->queue and ->wait */
-	kfree(netslice_queue);
-}
+	if (f->fp.len < 1 || f->fp.len > BPF_MAXINSNS)
+		return -EINVAL;
+	len = sizeof(f->fp.filter[0]) * f->fp.len;
 
-static struct netslice *netslice_create(struct netslice_filter *netslice_filter)
-{
-	struct netslice *netslice;
-	struct sock_fprog sock_filter;
-	struct sk_filter *sk_filter;
-	size_t len;
-	int cpu;
-
-	if (netslice_filter->filter.len < 1
-			|| netslice_filter->filter.len > BPF_MAXINSNS)
-		return NULL;
-	len = sizeof(netslice_filter->filter.filter[0])
-			* netslice_filter->filter.len;
-
-	sk_filter = kmalloc(sizeof(*sk_filter) + len, GFP_KERNEL);
-	if (!sk_filter)
-		return NULL;
-	ret = copy_from_user(sk_filter->insns, netslice_filter->filter.filter,
-				len);
+	n->skf = kmalloc(sizeof(*n->skf) + len, GFP_KERNEL);
+	if (!n->skf)
+		return -ENOMEM;
+	ret = copy_from_user(n->skf->insns, f->fp.filter, len);
 	if (ret) {
-		kfree(sk_filter);
+		kfree(n->skf);
 		return ret;
 	}
 
-	sk_filter->len = sock_fprog.len;
-	sk_filter->bpf_func = sk_run_filter;
-	ret = sk_chk_filter(sk_filter->insns, sk_filter->len);
+	n->skf->len = f->fp.len;
+	ret = sk_chk_filter(n->skf->insns, n->skf->len);
 	if (ret) {
-		kfree(sk_filter);
-		return NULL;
-	}
-	bpf_jit_compile(sk_filter);
-
-	netslice = kmalloc(sizeof(*netslice), GFP_KERNEL);
-	if (!netslice) {
-		kfree(sk_filter);
-		return NULL;
+		kfree(n->skf);
+		return ret;
 	}
 
-	INIT_LIST_HEAD(&netslice->netslices);
-	strncpy(netslice->name, netslice_filter->name);
-	atomic_set(&netslice->references, 0);
-	netslice->hooks = netslice_filter->hooks;
-	netslice->net = current->nsproxy->net_ns;
-	netslice->filter = sk_filter;
+	n->skf->bpf_func = sk_run_filter;
+	bpf_jit_compile(n->skf);
+	return 0;
+}
 
-	memset(read_queues, 0, sizeof(read_queues));
-	memset(write_queues, 0, sizeof(read_queues));
+static int netslice_init(struct netslice *n, struct netslice_filter *f)
+{
+	size_t len;
+	int cpu;
+
+	strncpy(n->name, f->name, NETSLICE_NAME_SIZE);
+	n->name[NETSLICE_NAME_SIZE - 1] = '\0';
+	atomic_set(&n->references, 1);
+	INIT_LIST_HEAD(&n->list);
+
 	for_each_possible_cpu(cpu) {
-		read_queues[cpu] = netslice_queue_create();
-		if (!read_queues[cpu]) {
-			netslice_destroy(netslice);
-			return NULL;
-		}
-		write_queues[cpu] = netslice_queue_create();
-		if (!write_queues[cpu]) {
-			netslice_destroy(netslice);
-			return NULL;
+		ret = netslice_queue_init(n->rx[cpu]);
+		if (ret)
+			return ret;
+		ret = netslice_queue_init(n->tx[cpu]);
+		if (ret)
+			return ret;
+	}
+
+	n->hooks = f->hooks;
+	n->net = current->nsproxy->net_ns;
+
+	ret = netslice_filter_init(n, f);
+	if (ret)
+		return ret;
+
+	write_lock(&netslices_lock);
+	list_for_each_entry(tmp, &netslices, list) {
+		if (strcmp(tmp->name, n->name) == 0) {
+			write_unlock(&netslices_lock);
+			kfree(n->skf);
+			return -EEXIST;
 		}
 	}
+	list_add(n, &netslices);
+	write_unlock(&netslices_lock);
 }
 
 static void netslice_destroy(struct netslice *netslice)
@@ -306,17 +298,6 @@ static long netslice_ioctl(struct file *file, unsigned int cmd,
 			return -ENOMEM;
 		atomic_inc(handle->netslice->references);
 
-		write_lock(&netslices_lock);
-		list_for_each(list, &netslices) {
-			netslice = list_entry(list, struct netslice, netslices);
-			if (strncmp(netslice->name, name) == 0) {
-				write_unlock(&netslices_lock);
-				return -EEXIST;
-			}
-		}
-		list_add(handle->netslice->netslices, &netslices);
-		write_unlock(&netslices_lock);
-		atomic_inc(handle->netslice->references);
 		break;
 
 	case NETSLICE_DESTROY:
@@ -1032,6 +1013,12 @@ int proc_get_userland(struct file *filp, const char __user * buff,
 	return count;
 }
 
+
+
+
+
+
+
 static struct file_operations netslice_fops = {
 	.owner = THIS_MODULE,
 	.read = netslice_read,
@@ -1041,8 +1028,7 @@ static struct file_operations netslice_fops = {
 	.open = netslice_open,
 };
 
-/* module initialization - called at module load time */
-static int __init netslice_init(void)
+static int __init netslice_module_init(void)
 {
 	int i, err = 0, cpu, max_if_idx = 0;
 	struct net_device *iface_dev;
@@ -1266,8 +1252,7 @@ static int __init netslice_init(void)
 	return err;
 }
 
-/* module unload, only succesful after the chrdev file descriptor is released */
-static void __exit netslice_exit(void)
+static void __exit netslice_module_exit(void)
 {
 	int cpu, i;
 	DECLARE_WAITQUEUE(wait, current);
@@ -1368,8 +1353,8 @@ static void __exit netslice_exit(void)
 	printk(KLOG ": %s removed\n", CHR_DEV_NAME);
 }
 
-module_init(netslice_init);
-module_exit(netslice_exit);
+module_init(netslice_module_init);
+module_exit(netslice_module_exit);
 
 MODULE_DESCRIPTION("Netslice packet filter");
 MODULE_AUTHOR("Robert Surton <burgess@cs.cornell.edu>");
